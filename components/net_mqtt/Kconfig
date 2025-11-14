@@ -1,0 +1,5 @@
+menu "Network & MQTT"
+config NET_DEFAULT_TOPIC
+    string "Default telemetry topic"
+    default "bia_kit/mpu"
+endmenu

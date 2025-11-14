@@ -1,0 +1,12 @@
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+# VSCode/CLion
+.vscode/
+.idea/
+# Python
+__pycache__/
+*.pyc
+# Secrets
+components/net_mqtt/include/secrets.h
