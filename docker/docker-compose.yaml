@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  broker:
+    image: eclipse-mosquitto:2
+    container_name: mqtt_broker
+    ports:
+      - "1883:1883"
+
+  hovercraft_host:
+    build: .
+    container_name: hovercraft_host
+    network_mode: host
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    devices:
+      - "/dev/video0:/dev/video0"
+    stdin_open: true
+    tty: true
