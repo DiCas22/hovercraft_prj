@@ -2,3 +2,6 @@ timestamp_ms,datetime,state,reason
 1764547696634,"2025-11-30 21:08:16","Sistema ligado","Programa iniciado"
 1764547702961,"2025-11-30 21:08:22","Teleop ativado","Modo inicial"
 1764547703967,"2025-11-30 21:08:23","Falha nos sensores","Sem dados de IMU por > 1s"
+1764550763605,"2025-11-30 21:59:23","Sistema ligado","Programa iniciado"
+1764550794718,"2025-11-30 21:59:54","Teleop ativado","Modo inicial"
+1764550795722,"2025-11-30 21:59:55","Falha nos sensores","Sem dados de IMU por > 1s"
