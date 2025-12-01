@@ -1,26 +1,26 @@
 #ifndef NO_H
 #define NO_H
 
-#include "../host_tools/msg_types.h"
+#include "msg_types.h"
 
-class No
-{
+// Nó da lista circular, guarda uma BufferMessage
+class No {
+public:
+    No(const BufferMessage& data, int priority);
+
+    const BufferMessage& getData() const { return _data_; }
+    void setData(const BufferMessage& d) { _data_ = d; }
+
+    int getPriority() const { return _priority_; }
+    void setPriority(int p) { _priority_ = p; }
+
+    No* getNext() const { return _next_; }
+    void setNext(No* n) { _next_ = n; }
+
 private:
     BufferMessage _data_;
-    No *_next_;
-    int _type_;
     int _priority_;
-
-public:
-    No(const BufferMessage &initData, int type, int priority = 0);
-
-    void setData(const BufferMessage &data);
-    void setNext(No *next);
-
-    const BufferMessage &getData() const;
-    int getType() const;
-    int getPriority() const;
-    No *getNext() const;
+    No* _next_;
 };
 
-#endif
+#endif // NO_H

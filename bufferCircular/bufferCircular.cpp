@@ -4,129 +4,115 @@ bufferCircular::bufferCircular(int maxElems)
     : _begin_(nullptr),
       _numElems_(0),
       _numMaxElems_(maxElems)
-{
+{}
+
+bufferCircular::~bufferCircular() {
+    std::unique_lock<std::mutex> lock(_mtx_);
+    No* cur = _begin_;
+    if (!cur) return;
+
+    No* start = _begin_;
+    do {
+        No* nxt = cur->getNext();
+        delete cur;
+        cur = nxt;
+    } while (cur && cur != start);
+
+    _begin_ = nullptr;
+    _numElems_.store(0);
 }
 
-int bufferCircular::getLen() const
-{
-    return _numElems_;
-}
+void bufferCircular::insert_sorted_nolock(const BufferMessage& msg) {
+    No* newNo = new No(msg, msg.priority);
 
-bool bufferCircular::insertData(const BufferMessage &data, int type, int priority)
-{
-    if (_numMaxElems_ != 0 && _numElems_ == _numMaxElems_)
-        return false; // cheio
-
-    No *newNo = new No(data, type, priority);
-
-    if (_begin_ == nullptr)
-    {
+    if (_begin_ == nullptr) {
         newNo->setNext(newNo);
         _begin_ = newNo;
         _numElems_++;
-        return true;
+        return;
     }
 
-    // lista circular ordenada por prioridade (maior primeiro)
-    No *current = _begin_;
+    No* current = _begin_;
+    No* prev = nullptr;
 
-    // anda enquanto o próximo tiver prioridade >= e não voltar ao início
-    while (current->getNext() != _begin_ &&
-           current->getNext()->getPriority() >= priority)
-    {
-        current = current->getNext();
-    }
-
-    No *temp = current->getNext();
-    current->setNext(newNo);
-    newNo->setNext(temp);
-
-    // se o novo nó tiver prioridade maior que o begin, vira o novo begin
-    if (priority > _begin_->getPriority())
-    {
-        _begin_ = newNo;
-    }
-
-    _numElems_++;
-    return true;
-}
-
-const BufferMessage &bufferCircular::getFirstData() const
-{
-    return _begin_->getData();
-}
-
-int bufferCircular::getFirstType() const
-{
-    return _begin_->getType();
-}
-
-int bufferCircular::getFirstPriority() const
-{
-    return _begin_->getPriority();
-}
-
-bool bufferCircular::searchData(const BufferMessage &data) const
-{
-    if (_begin_ == nullptr)
-        return false;
-
-    No *current = _begin_;
-    do
-    {
-        if (&(current->getData()) == &data)
-            return true; // comparação por endereço
-        current = current->getNext();
-    } while (current != _begin_);
-
-    return false;
-}
-
-bool bufferCircular::removeData(const BufferMessage &data)
-{
-    if (_begin_ == nullptr)
-        return false;
-
-    No *current = _begin_;
-    No *prev = nullptr;
-
-    // procura nó cujo ponteiro de data é o mesmo
-    do
-    {
-        if (&(current->getData()) == &data)
+    // lista ordenada por prioridade decrescente
+    do {
+        if (msg.priority > current->getPriority()) {
             break;
+        }
         prev = current;
         current = current->getNext();
     } while (current != _begin_);
 
-    if (&(current->getData()) != &data)
-        return false; // não achou
-
-    if (current == _begin_)
-    {
-        if (_begin_->getNext() == _begin_)
-        {
-            // só 1 elemento
-            delete _begin_;
-            _begin_ = nullptr;
+    if (!prev) {
+        // inserir antes do _begin_
+        No* last = _begin_;
+        while (last->getNext() != _begin_) {
+            last = last->getNext();
         }
-        else
-        {
-            // achar último pra fechar o círculo
-            No *last = _begin_;
-            while (last->getNext() != _begin_)
-                last = last->getNext();
-            _begin_ = _begin_->getNext();
-            last->setNext(_begin_);
-            delete current;
-        }
-    }
-    else
-    {
-        prev->setNext(current->getNext());
-        delete current;
+        newNo->setNext(_begin_);
+        last->setNext(newNo);
+        _begin_ = newNo;
+    } else {
+        prev->setNext(newNo);
+        newNo->setNext(current);
     }
 
+    _numElems_++;
+}
+
+void bufferCircular::push(const BufferMessage& msg) {
+    std::unique_lock<std::mutex> lock(_mtx_);
+
+    if (_numMaxElems_ > 0 && _numElems_.load() >= _numMaxElems_) {
+        // política simples: remove último (menor prioridade)
+        if (_begin_) {
+            No* cur = _begin_;
+            No* prev = nullptr;
+            while (cur->getNext() != _begin_) {
+                prev = cur;
+                cur = cur->getNext();
+            }
+            if (prev) {
+                prev->setNext(_begin_);
+            } else {
+                _begin_ = nullptr;
+            }
+            delete cur;
+            _numElems_--;
+        }
+    }
+
+    insert_sorted_nolock(msg);
+    _cv_not_empty.notify_one();
+}
+
+BufferMessage bufferCircular::pop_nolock() {
+    No* node = _begin_;
+    BufferMessage out = node->getData();
+
+    if (_numElems_.load() == 1) {
+        _begin_ = nullptr;
+    } else {
+        No* last = _begin_;
+        while (last->getNext() != _begin_) {
+            last = last->getNext();
+        }
+        _begin_ = node->getNext();
+        last->setNext(_begin_);
+    }
+
+    delete node;
     _numElems_--;
-    return true;
+    return out;
+}
+
+BufferMessage bufferCircular::pop() {
+    std::unique_lock<std::mutex> lock(_mtx_);
+    _cv_not_empty.wait(lock, [this]{ return _numElems_.load() > 0; });
+    return pop_nolock();
+}
+
+int bufferCircular::getLen() const {
+    return _numElems_.load();
 }

@@ -1,29 +1,35 @@
-#ifndef BUFFERCIRCULAR_H
-#define BUFFERCIRCULAR_H
+#ifndef BUFFER_CIRCULAR_H
+#define BUFFER_CIRCULAR_H
 
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include "msg_types.h"
 #include "No.h"
 
-class bufferCircular
-{
-private:
-    No *_begin_;
-    int _numElems_;
-    int _numMaxElems_;
-
+// Buffer circular com prioridade para BufferMessage
+class bufferCircular {
 public:
     explicit bufferCircular(int maxElems = 0);
+    ~bufferCircular();
+
+    // Insere mensagem (maior prioridade é atendida primeiro)
+    void push(const BufferMessage& msg);
+
+    // Retorna próxima mensagem (bloqueia até existir algo)
+    BufferMessage pop();
 
     int getLen() const;
 
-    int getFirstType() const;
-    int getFirstPriority() const;
-    const BufferMessage &getFirstData() const;
+private:
+    No* _begin_;                       // início da lista circular
+    std::atomic<int> _numElems_;       // número de elementos
+    int _numMaxElems_;                 // 0 = sem limite
+    mutable std::mutex _mtx_;
+    std::condition_variable _cv_not_empty;
 
-    // insere ordenado por prioridade (maior primeiro)
-    bool insertData(const BufferMessage &data, int type, int priority = 0);
-
-    bool searchData(const BufferMessage &data) const;
-    bool removeData(const BufferMessage &data);
+    void insert_sorted_nolock(const BufferMessage& msg);
+    BufferMessage pop_nolock();
 };
 
-#endif
+#endif // BUFFER_CIRCULAR_H

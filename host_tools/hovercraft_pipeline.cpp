@@ -2,10 +2,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <queue>
 #include <optional>
 #include <vector>
-#include <deque>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -24,23 +22,12 @@
 using json = nlohmann::json;
 using namespace std::chrono;
 
-// ==================== Estruturas ===================
-struct HovercraftState {
-    double x = 0, y = 0, z = 0;
-    double vx = 0, vy = 0, vz = 0;
-    double ax = 0, ay = 0, az = 0;
-    double yaw = 0, pitch = 0, roll = 0;
-    bool valid = false;
-    uint64_t t_ms = 0;
-};
+#include "msg_types.h"
+#include "bufferCircular.h"
 
-struct TrajectoryRef {
-    double x_ref = 0, y_ref = 0;
-    double vx_ref = 0, vy_ref = 0;
-    double ax_ref = 0, ay_ref = 0;
-    uint64_t t_ms = 0;
-};
+bufferCircular g_buffer(256);
 
+// ==================== Modos de operação ===================
 enum class Mode {
     AUTONOMOUS = 1,
     TELEOP     = 2
@@ -55,7 +42,7 @@ enum class SystemState {
     FALHA_SENSORES
 };
 
-// ==================== Terminal raw mode guard ==================
+// ==================== Terminal raw mode ==================
 struct TerminalRawGuard {
     termios orig{};
     bool ok = false;
@@ -63,7 +50,7 @@ struct TerminalRawGuard {
     TerminalRawGuard() {
         if (tcgetattr(STDIN_FILENO, &orig) == 0) {
             termios raw = orig;
-            raw.c_lflag &= ~(ICANON | ECHO); // sem modo canônico e sem eco
+            raw.c_lflag &= ~(ICANON | ECHO);
             raw.c_cc[VMIN]  = 1;
             raw.c_cc[VTIME] = 0;
             tcsetattr(STDIN_FILENO, TCSANOW, &raw);
@@ -91,6 +78,7 @@ std::string state_to_string(SystemState s) {
     return "Desconhecido";
 }
 
+// Registra mudança de estado do sistema em CSV + stdout
 void log_state_change(SystemState new_state, const std::string& reason = "") {
     static std::mutex log_mtx;
     static SystemState last_state = SystemState::SISTEMA_LIGADO;
@@ -98,7 +86,6 @@ void log_state_change(SystemState new_state, const std::string& reason = "") {
 
     std::lock_guard<std::mutex> lk(log_mtx);
 
-    // Evita registrar o mesmo estado repetidas vezes
     if (!first && new_state == last_state) {
         return;
     }
@@ -111,7 +98,6 @@ void log_state_change(SystemState new_state, const std::string& reason = "") {
         return;
     }
 
-    // Cabeçalho se arquivo recém-criado
     if (log_file.tellp() == 0) {
         log_file << "timestamp_ms,datetime,state,reason\n";
     }
@@ -137,15 +123,12 @@ void log_state_change(SystemState new_state, const std::string& reason = "") {
 }
 
 // ==================== MQTT Wrapper ==================
+// Encapsula MQTT: recebe IMU/trajetória e publica estado e comandos
 class MQTTClient : public mosqpp::mosquittopp {
 public:
     HovercraftState lastIMU{};
     std::mutex imu_mtx;
     bool new_imu = false;
-
-    // Trajectory queue (FIFO)
-    std::mutex traj_mtx;
-    std::deque<TrajectoryRef> traj_queue;
 
     MQTTClient(const std::string& id, const std::string& host, int port)
         : mosqpp::mosquittopp(id.c_str())
@@ -199,7 +182,7 @@ public:
         }
     }
 
-    // Publica estimativa (monitoramento / plot externo)
+    // Publica estimativa (para monitoramento externo)
     void publish_pose(const HovercraftState& state) {
         json j = {
             {"x", state.x}, {"y", state.y}, {"z", state.z},
@@ -213,7 +196,7 @@ public:
                 static_cast<int>(payload.size()), payload.c_str());
     }
 
-    // Publica comando de motor/servo
+    // Publica comando motor/servo
     void publish_cmd(uint32_t motor_us, uint32_t servo_us) {
         json j = {{"motor_us", motor_us}, {"servo_us", servo_us}};
         std::string payload = j.dump();
@@ -221,7 +204,7 @@ public:
                 static_cast<int>(payload.size()), payload.c_str());
     }
 
-    // ======= Trajectory helpers =======
+    // Converte JSON de trajetória para mensagens no buffer
     void handle_trajectory_message(const json& j) {
         auto make_ref = [](const json& jj) -> TrajectoryRef {
             TrajectoryRef r;
@@ -235,37 +218,29 @@ public:
             return r;
         };
 
-        std::lock_guard<std::mutex> lk(traj_mtx);
+        auto push_traj = [](const TrajectoryRef& r) {
+            BufferMessage msg;
+            msg.type     = MsgType::TRAJECTORY;
+            msg.priority = 5;
+            msg.payload  = r;
+            g_buffer.push(msg);
+        };
 
         if (j.is_array()) {
-            std::cout << "[TRAJ] Received array of " << j.size() << " trajectories:\n";
             for (const auto& elem : j) {
                 if (!elem.is_object()) continue;
                 TrajectoryRef r = make_ref(elem);
-                traj_queue.push_back(r);
-                std::cout << "  - x_ref=" << r.x_ref
-                          << ", y_ref=" << r.y_ref << "\n";
+                push_traj(r);
             }
         } else if (j.is_object()) {
             TrajectoryRef r = make_ref(j);
-            traj_queue.push_back(r);
-            std::cout << "[TRAJ] Received trajectory: x_ref="
-                      << r.x_ref << ", y_ref=" << r.y_ref << "\n";
-        } else {
-            std::cerr << "[TRAJ] Invalid trajectory JSON (not object/array)\n";
+            push_traj(r);
         }
-    }
-
-    bool get_next_trajectory(TrajectoryRef& out) {
-        std::lock_guard<std::mutex> lk(traj_mtx);
-        if (traj_queue.empty()) return false;
-        out = traj_queue.front();
-        traj_queue.pop_front();
-        return true;
     }
 };
 
 // ============== Processamento de Imagem ============
+// Detecta blob colorido e estima posição 3D aproximada
 std::optional<HovercraftState> detect_hovercraft_blob(
     const cv::Mat& frame, cv::Scalar hsv_low, cv::Scalar hsv_high,
     double fx, double fy, double cx, double cy, double obj_real_mm)
@@ -308,17 +283,15 @@ std::optional<HovercraftState> detect_hovercraft_blob(
     return state;
 }
 
-// =================== Fusão/EKF "stub" ====================
+// =================== Fusão/EKF simples ====================
+// Atualiza estado estimado usando IMU e correção da câmera
 HovercraftState run_ekf(const HovercraftState& last,
                         const std::optional<HovercraftState>& cam_obs,
                         const HovercraftState& lastIMU)
 {
     HovercraftState est = last;
+    double dt = 0.02; // 50 Hz
 
-    // Loop do filtro a 50 Hz
-    double dt = 0.02;
-
-    // Propaga estado usando aceleração da IMU (Euler)
     est.ax = lastIMU.ax;
     est.ay = lastIMU.ay;
     est.az = lastIMU.az;
@@ -331,12 +304,10 @@ HovercraftState run_ekf(const HovercraftState& last,
     est.y += est.vy * dt;
     est.z += est.vz * dt;
 
-    // Copia ângulos da IMU
     est.yaw   = lastIMU.yaw;
     est.pitch = lastIMU.pitch;
     est.roll  = lastIMU.roll;
 
-    // Correção simples com câmera
     if (cam_obs && cam_obs->valid) {
         est.x = 0.8 * est.x + 0.2 * cam_obs->x;
         est.y = 0.8 * est.y + 0.2 * cam_obs->y;
@@ -348,32 +319,28 @@ HovercraftState run_ekf(const HovercraftState& last,
     return est;
 }
 
-// ============== Controle (PI) ================
+// ============== Controle (PI plano XY) ================
+// Gera comandos de motor/servo a partir do estado e referência
 void run_control(const HovercraftState& est, const TrajectoryRef& ref,
                  MQTTClient& mqtt)
 {
-    // Erro de posição, integra (para gerar erro de velocidade)
     static double int_ex = 0, int_ey = 0;
-    constexpr double dt = 0.02; // deve bater com a frequência real do loop
+    constexpr double dt = 0.02;
 
     double ex = ref.x_ref - est.x;
     double ey = ref.y_ref - est.y;
     int_ex += ex * dt;
     int_ey += ey * dt;
 
-    // Gera aceleração desejada (PI)
     double ax_des = 2.0 * ex + 0.2 * int_ex;
     double ay_des = 2.0 * ey + 0.2 * int_ey;
 
-    // Erro entre aceleração desejada x medida (IMU)
     double e_ax = ax_des - est.ax;
     double e_ay = ay_des - est.ay;
 
-    // Controle simplificado (direção e intensidade)
     double acc_cmd = std::sqrt(e_ax * e_ax + e_ay * e_ay);
     double dir_rad = std::atan2(e_ay, e_ax);
 
-    // Mapear para comando PWM
     uint32_t motor_us = std::clamp(
         1200u + static_cast<uint32_t>(acc_cmd * 250.0),
         1000u, 2000u
@@ -384,44 +351,36 @@ void run_control(const HovercraftState& est, const TrajectoryRef& ref,
         std::clamp(servo_raw, 1000, 2000)
     );
 
-    // Comando
     mqtt.publish_cmd(motor_us, servo_us);
 }
 
-// ================== Trajectory completion ==================
+// ================== Critério de término da trajetória ==================
 bool trajectory_finished(const HovercraftState& est, const TrajectoryRef& ref) {
     double ex = ref.x_ref - est.x;
     double ey = ref.y_ref - est.y;
     double dist = std::sqrt(ex * ex + ey * ey);
-    // Tolerância de 20 mm (ajuste conforme necessário)
-    return dist < 20.0;
+    return dist < 20.0; // tolerância em mm
 }
 
-// =============== MAIN (pipeline em threads) =======================
+// =============== MAIN (pipeline multi-thread) =======================
 int main() {
-    // MQTT client
     mosqpp::lib_init();
     MQTTClient mqtt("hc_host", "broker.hivemq.com", 1883);
 
-    // Flags e estados compartilhados
     std::atomic<bool> running{true};
     std::atomic<Mode> g_mode{Mode::AUTONOMOUS};
     std::atomic<bool> sensor_failure{false};
 
-    // Teleop state (PWM pulses)
-    std::atomic<uint32_t> teleop_motor_us{1000}; // ESC off
-    std::atomic<uint32_t> teleop_servo_us{1500}; // center
+    std::atomic<uint32_t> teleop_motor_us{1000};
+    std::atomic<uint32_t> teleop_servo_us{1500};
 
-    // Camera obs compartilhada
     std::mutex cam_mtx;
     std::optional<HovercraftState> last_cam_obs;
     bool new_cam_obs = false;
 
-    // Estado estimado compartilhado
     std::mutex est_mtx;
     HovercraftState est_state{};
 
-    // Camera intrinsics/config
     const int W = 640, H = 480;
     constexpr double FOVX_DEG = 62.0;
     double fovx_rad = FOVX_DEG * CV_PI / 180.0;
@@ -432,20 +391,17 @@ int main() {
     constexpr double OBJ_REAL_MM = 100.0;
     cv::Scalar HSV_LOW(100, 90, 80), HSV_HIGH(130, 255, 255);
 
-    // ---------- UI inicial (modo) ----------
     std::cout << "==================== HOVERCRAFT PIPELINE ====================\n";
-    std::cout << "Comandos em tempo real (depois de escolher o modo):\n";
-    std::cout << "  1 = modo AUTONOMOUS\n";
-    std::cout << "  2 = modo TELEOP\n";
-    std::cout << "  w/s = aumenta/diminui motor (PWM)\n";
-    std::cout << "  q/e = vira esquerda/direita (servo)\n";
-    std::cout << "  x   = sair do TELEOP (voltar para AUTONOMOUS)\n";
+    std::cout << "  1 = AUTONOMOUS\n";
+    std::cout << "  2 = TELEOP\n";
+    std::cout << "  w/s = motor +/-\n";
+    std::cout << "  q/e = servo esquerda/direita\n";
+    std::cout << "  x   = sair do TELEOP -> AUTONOMOUS\n";
     std::cout << "  Ctrl+C = encerrar programa\n";
     std::cout << "=============================================================\n";
 
     log_state_change(SystemState::SISTEMA_LIGADO, "Programa iniciado");
 
-    // Pergunta modo inicial (linha-bufferizado, precisa ENTER)
     std::cout << "Selecione modo inicial (1=AUTONOMOUS, 2=TELEOP): ";
     int mode_sel = 1;
     if (std::cin >> mode_sel && mode_sel == 2) {
@@ -458,7 +414,7 @@ int main() {
         log_state_change(SystemState::AUTONOMO_ATIVADO, "Modo inicial");
     }
 
-    // ---------- THREAD: Image recognition ----------
+    // Thread de visão
     std::thread image_thread([&](){
         cv::VideoCapture cap(0);
         cap.set(cv::CAP_PROP_FRAME_WIDTH, W);
@@ -492,12 +448,12 @@ int main() {
         cap.release();
     });
 
-    // ---------- THREAD: EKF / filter + detecção de falha ----------
+    // Thread de filtro / EKF + detecção de falha de sensor
     std::thread filter_thread([&](){
         HovercraftState local_est{};
-        const auto period = std::chrono::milliseconds(20); // 50 Hz
+        const auto period = std::chrono::milliseconds(20);
         auto last_imu_time = steady_clock::now();
-        const auto sensor_timeout = std::chrono::milliseconds(1000); // 1 s sem IMU => falha
+        const auto sensor_timeout = std::chrono::milliseconds(1000);
 
         while (running.load()) {
             HovercraftState imu{};
@@ -531,103 +487,113 @@ int main() {
                 }
 
                 mqtt.publish_pose(local_est);
+
+                BufferMessage msg;
+                msg.type     = MsgType::EKF_STATE;
+                msg.priority = 4;
+                msg.payload  = local_est;
+                g_buffer.push(msg);
             }
 
-            // Verifica timeout de sensor
             auto now = steady_clock::now();
             if (!sensor_failure.load() &&
                 now - last_imu_time > sensor_timeout) {
 
                 sensor_failure.store(true);
-                mqtt.publish_cmd(1000, 1500); // desliga motor e centraliza servo
+                mqtt.publish_cmd(1000, 1500);
                 log_state_change(SystemState::FALHA_SENSORES,
                                  "Sem dados de IMU por > 1s");
+
+                StatusEvent st{ "Falha nos sensores" };
+                BufferMessage msg;
+                msg.type     = MsgType::STATUS_EVENT;
+                msg.priority = 8;
+                msg.payload  = st;
+                g_buffer.push(msg);
             }
 
             std::this_thread::sleep_for(period);
         }
     });
 
-    // ---------- THREAD: Control (autonomous / teleop) ----------
+    // Thread de controle (consumidor do buffer)
     std::thread control_thread([&](){
         TrajectoryRef active_ref{};
         bool has_traj = false;
-        const auto period = std::chrono::milliseconds(50); // 20 Hz
+        HovercraftState last_est{};
+        TeleopCmd last_teleop{};
 
         while (running.load()) {
-            // Se falha de sensor, garante motores zerados e não faz nada
-            if (sensor_failure.load()) {
-                mqtt.publish_cmd(1000, 1500);
-                std::this_thread::sleep_for(period);
-                continue;
-            }
+            BufferMessage msg = g_buffer.pop();
 
-            Mode mode = g_mode.load();
+            switch (msg.type) {
+            case MsgType::STATUS_EVENT: {
+                const auto& st = std::get<StatusEvent>(msg.payload);
+                std::cout << "[STATE] " << st.text << "\n";
 
-            // -------- TELEOP --------
-            if (mode == Mode::TELEOP) {
-                uint32_t m = teleop_motor_us.load();
-                uint32_t s = teleop_servo_us.load();
-                mqtt.publish_cmd(m, s);
-                std::this_thread::sleep_for(period);
-                continue;
-            }
-
-            // -------- AUTONOMOUS --------
-            HovercraftState est{};
-            {
-                std::lock_guard<std::mutex> lk(est_mtx);
-                est = est_state;
-            }
-
-            if (!has_traj) {
-                TrajectoryRef next{};
-                if (mqtt.get_next_trajectory(next)) {
-                    active_ref = next;
-                    has_traj = true;
-                    log_state_change(SystemState::TRAJETORIA_RECEBIDA,
-                                     "x_ref=" + std::to_string(active_ref.x_ref) +
-                                     ", y_ref=" + std::to_string(active_ref.y_ref));
-                    log_state_change(SystemState::EM_TRAJETO,
-                                     "Iniciando seguimento de trajetoria");
-                    std::cout << "[CTRL] Starting trajectory: x_ref="
-                              << active_ref.x_ref << ", y_ref=" << active_ref.y_ref << "\n";
+                if (st.text.find("Falha nos sensores") != std::string::npos) {
+                    mqtt.publish_cmd(1000, 1500);
                 }
+                break;
             }
 
-            if (has_traj) {
-                run_control(est, active_ref, mqtt);
-
-                if (trajectory_finished(est, active_ref)) {
-                    std::cout << "[CTRL] Trajectory finished.\n";
-                    has_traj = false;
-                    log_state_change(SystemState::AUTONOMO_ATIVADO,
-                                     "Trajetoria finalizada, mantendo autonomo parado");
+            case MsgType::EKF_STATE: {
+                last_est = std::get<HovercraftState>(msg.payload);
+                if (g_mode.load() == Mode::AUTONOMOUS && has_traj) {
+                    run_control(last_est, active_ref, mqtt);
+                    if (trajectory_finished(last_est, active_ref)) {
+                        has_traj = false;
+                        StatusEvent st{ "Trajetória concluída" };
+                        BufferMessage done_msg;
+                        done_msg.type     = MsgType::STATUS_EVENT;
+                        done_msg.priority = 7;
+                        done_msg.payload  = st;
+                        g_buffer.push(done_msg);
+                    }
                 }
-            } else {
-                // Sem trajetória: poderia manter motores parados, se quiser
-                // mqtt.publish_cmd(1000, 1500);
+                break;
             }
 
-            std::this_thread::sleep_for(period);
+            case MsgType::TRAJECTORY: {
+                active_ref = std::get<TrajectoryRef>(msg.payload);
+                has_traj   = true;
+                std::cout << "[CTRL] Nova trajetória: x_ref="
+                          << active_ref.x_ref << ", y_ref=" << active_ref.y_ref << "\n";
+
+                StatusEvent st{ "Trajetória recebida" };
+                BufferMessage st_msg;
+                st_msg.type     = MsgType::STATUS_EVENT;
+                st_msg.priority = 7;
+                st_msg.payload  = st;
+                g_buffer.push(st_msg);
+
+                log_state_change(SystemState::TRAJETORIA_RECEBIDA);
+                break;
+            }
+
+            case MsgType::TELEOP_CMD: {
+                last_teleop = std::get<TeleopCmd>(msg.payload);
+                if (g_mode.load() == Mode::TELEOP) {
+                    mqtt.publish_cmd(last_teleop.motor_us, last_teleop.servo_us);
+                }
+                break;
+            }
+            }
         }
     });
 
-    // ---------- THREAD: Keyboard / teleop (sem ENTER) ----------
+    // Thread de teclado / teleop (modo raw, sem ENTER)
     std::thread keyboard_thread([&](){
-        TerminalRawGuard guard;  // deixa terminal em modo raw enquanto a thread existir
+        TerminalRawGuard guard;
 
         std::cout << "[KEY] Controle em tempo real ativo. 'x' sai do TELEOP.\n";
 
         while (running.load()) {
-            int ch = getchar();   // bloqueia só nesta thread
-            if (ch == EOF) {
-                break;
-            }
+            int ch = getchar();
+            if (ch == EOF) break;
 
             char c = static_cast<char>(ch);
 
-            // troca de modo instantânea
             if (c == '1') {
                 g_mode.store(Mode::AUTONOMOUS);
                 log_state_change(SystemState::AUTONOMO_ATIVADO,
@@ -642,11 +608,10 @@ int main() {
 
             Mode mode = g_mode.load();
 
-            // 'x' sai APENAS do TELEOP (volta pra AUTONOMOUS e zera comandos)
             if ((c == 'x' || c == 'X') && mode == Mode::TELEOP) {
                 teleop_motor_us.store(1000);
                 teleop_servo_us.store(1500);
-                mqtt.publish_cmd(1000, 1500); // garante motor parado / servo central
+                mqtt.publish_cmd(1000, 1500);
                 g_mode.store(Mode::AUTONOMOUS);
                 log_state_change(SystemState::AUTONOMO_ATIVADO,
                                  "Saida do teleop (x)");
@@ -654,7 +619,6 @@ int main() {
                 continue;
             }
 
-            // TELOP: comandos só se estiver em modo TELEOP e sem falha de sensor
             if (mode == Mode::TELEOP && !sensor_failure.load()) {
                 if (c == 'w' || c == 'W') {
                     uint32_t m = teleop_motor_us.load();
@@ -674,6 +638,16 @@ int main() {
                     teleop_servo_us.store(s);
                 }
 
+                TeleopCmd cmd;
+                cmd.motor_us = teleop_motor_us.load();
+                cmd.servo_us = teleop_servo_us.load();
+
+                BufferMessage msg;
+                msg.type     = MsgType::TELEOP_CMD;
+                msg.priority = 6;
+                msg.payload  = cmd;
+                g_buffer.push(msg);
+
                 std::cout << "\r[TELEOP] motor_us=" << teleop_motor_us.load()
                           << " servo_us=" << teleop_servo_us.load()
                           << "           " << std::flush;
@@ -683,7 +657,6 @@ int main() {
 
     if (keyboard_thread.joinable()) keyboard_thread.join();
 
-    // Finaliza threads
     running.store(false);
     if (image_thread.joinable())   image_thread.join();
     if (filter_thread.joinable())  filter_thread.join();
