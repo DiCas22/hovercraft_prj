@@ -81,7 +81,6 @@ class CriadorRotaSetas:
         self.x = 0
         self.y = 0
 
-        # Binds do teclado (apenas quando criando rota)
         root.bind("<Up>", self.mover)
         root.bind("<Down>", self.mover)
         root.bind("<Left>", self.mover)
@@ -113,10 +112,9 @@ class CriadorRotaSetas:
         elif event.keysym == "Right":
             novo_x += 1
 
-        # 🔥 Impedir sair do grid 10x10
         if not (self.GRID_MIN <= novo_x <= self.GRID_MAX and
                 self.GRID_MIN <= novo_y <= self.GRID_MAX):
-            return  # ignora movimento fora do grid
+            return
 
         self.x, self.y = novo_x, novo_y
         self.pontos.append((self.x, self.y))
@@ -180,11 +178,10 @@ class CriadorRotaSetas:
         self.atualizar_lista()
         messagebox.showinfo("OK", f"Rota '{safe}' salva em {PASTA_ROTAS}/{safe}.txt")
 
-        # 🔥 RESETAR TUDO APÓS SALVAR 🔥
-        self.modo_criacao = False       # desligar modo criação
-        self.pontos = [(0, 0)]          # reiniciar lista de pontos
-        self.x, self.y = 0, 0           # reiniciar coordenadas
-        self.atualizar_grafico()        # redesenhar gráfico limpo
+        self.modo_criacao = False       
+        self.pontos = [(0, 0)]          
+        self.x, self.y = 0, 0           
+        self.atualizar_grafico()        
 
     # ---------------------------------------------------------
     def carregar_rota(self):
