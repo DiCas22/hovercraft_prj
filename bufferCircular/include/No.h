@@ -1,25 +1,31 @@
-#pragma once
+#ifndef NO_H
+#define NO_H
 
-#include "../host_tools/msg_types.h"
+#include <iostream>
+using namespace std;
 
 class No
 {
 private:
-    BufferMessage _data_;
-    No *_next_ = nullptr;
+    auto _data_;
+    No *_next_;
+    int _type_;
+    int _priority_;
 
 public:
-    No(const BufferMessage &msg)
-        : _data_(msg), _next_(nullptr) {}
+    No(auto initData = 0, int type, int priority = 0);
 
-    void setData(const BufferMessage &msg) { _data_ = msg; }
-    void setNext(No *next) { _next_ = next; }
+    void setData(auto data);
 
-    const BufferMessage &getData() const { return _data_; }
-    BufferMessage &getData() { return _data_; }
+    void setNext(No *next);
 
-    No *getNext() const { return _next_; }
+    auto getData() const;
 
-    int getType() const { return static_cast<int>(_data_.type); }
-    int getPriority() const { return _data_.priority; }
+    int getType() const;
+
+    int getPriority() const;
+
+    No *getNext() const;
 };
+
+#endif

@@ -1,11 +1,10 @@
 #include "bufferCircular.h"
-#include <chrono>
 
-bufferCircular::bufferCircular(int maxElems)
-    : _begin_(nullptr),
-      _numElems_(0),
-      _numMaxElems_(maxElems)
+bufferCircular::bufferCircular(int maxElems = 0)
 {
+    this->_begin_ = nullptr;
+    this->_numElems_ = 0;
+    this->_numMaxElems_ = maxElems;
 }
 
 int bufferCircular::getLen() const
@@ -13,114 +12,99 @@ int bufferCircular::getLen() const
     return _numElems_;
 }
 
-bool bufferCircular::push(const BufferMessage &msg)
+bool bufferCircular::insertData(auto data, int type, int priority = 0)
 {
-    std::unique_lock<std::mutex> lock(_mtx_);
-
-    if (_numMaxElems_ != 0 && _numElems_ == _numMaxElems_)
-    {
-        // buffer cheio
+    if (_numElems_ == _numMaxElems_ && _numMaxElems_ != 0)
         return false;
-    }
 
-    No *newNo = new No(msg);
+    No *newNo = new No(data, type, priority);
 
     if (_begin_ == nullptr)
     {
-        // primeiro elemento
         newNo->setNext(newNo);
         _begin_ = newNo;
+        _numElems_++;
+        return true;
     }
     else
     {
-        // insere mantendo ordem decrescente de prioridade
         No *current = _begin_;
-        // queremos parar no último nó com prioridade >= à nova
-        while (current->getNext() != _begin_ &&
-               current->getNext()->getPriority() >= msg.priority)
+        while (current->getNext()->getPriority >= priority && current->getNext() != _begin_)
         {
             current = current->getNext();
         }
         No *temp = current->getNext();
         current->setNext(newNo);
         newNo->setNext(temp);
-
-        // se o novo tem prioridade maior que o "begin", vira o novo início
-        if (msg.priority > _begin_->getPriority())
-        {
-            _begin_ = newNo;
-        }
+        _numElems_++;
+        return true;
     }
 
-    ++_numElems_;
-    lock.unlock();
-    _cv_not_empty.notify_one(); // sinaliza que agora tem item
-    return true;
+    return false;
 }
 
-bool bufferCircular::pop_nolock(BufferMessage &out)
+auto bufferCircular::getFirstData()
 {
-    if (_begin_ == nullptr || _numElems_ == 0)
+    return _begin_->getData();
+}
+
+int bufferCircular::getFirstType()
+{
+    return _begin_->getType();
+}
+
+int bufferCircular::getFirstPriority()
+{
+    return _begin_->getPriority();
+}
+
+bool bufferCircular::searchData(auto data)
+{
+    if (_begin_ == nullptr)
     {
         return false;
     }
 
-    No *first = _begin_;
-
-    if (_numElems_ == 1)
+    No *current = _begin_;
+    while (current != nullptr)
     {
-        _begin_ = nullptr;
+        if (current->getData() == data)
+            return true;
+        current = current->getNext();
     }
-    else
+
+    return false;
+}
+
+bool bufferCircular::removeData(auto data)
+{
+    if (_begin_ == nullptr)
     {
-        // achar o último (para manter circular)
-        No *last = _begin_;
-        while (last->getNext() != _begin_)
-        {
-            last = last->getNext();
-        }
+        return false;
+    }
+
+    if (_begin_->getData() == data)
+    {
+        No *temp = _begin_;
         _begin_ = _begin_->getNext();
-        last->setNext(_begin_);
+        delete temp;
+        _numElems_--;
+        return true;
     }
 
-    out = first->getData();
-    delete first;
-    --_numElems_;
-    return true;
-}
+    No *current = _begin_;
 
-BufferMessage bufferCircular::pop()
-{
-    std::unique_lock<std::mutex> lock(_mtx_);
-    _cv_not_empty.wait(lock, [&]
-                       { return _numElems_ > 0; });
-
-    BufferMessage msg{};
-    pop_nolock(msg);
-    return msg;
-}
-
-bool bufferCircular::pop_timed(BufferMessage &out, int timeout_ms)
-{
-    std::unique_lock<std::mutex> lock(_mtx_);
-
-    if (!_cv_not_empty.wait_for(
-            lock,
-            std::chrono::milliseconds(timeout_ms),
-            [&]
-            { return _numElems_ > 0; }))
+    while (current->getNext() != _begin_ && current->getNext()->getData() != data)
     {
-        return false; // timeout
+        current = current->getNext();
     }
 
-    return pop_nolock(out);
-}
-
-bool bufferCircular::peek(BufferMessage &out)
-{
-    std::lock_guard<std::mutex> lock(_mtx_);
-    if (_begin_ == nullptr || _numElems_ == 0)
+    if (current->getNext() == _begin_)
         return false;
-    out = _begin_->getData();
+
+    No *temp = current->getNext();
+    current->setNext(temp->getNext());
+    delete temp;
+    _numElems_--;
     return true;
 }
