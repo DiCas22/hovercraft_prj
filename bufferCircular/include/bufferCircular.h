@@ -1,7 +1,7 @@
-#include "No.h"
+#ifndef BUFFERCIRCULAR_H
+#define BUFFERCIRCULAR_H
 
-#ifndef BUFFERCIRCULAR.H
-#define BUFFERCIRCULAR .H
+#include "No.h"
 
 class bufferCircular
 {
@@ -11,15 +11,19 @@ private:
     int _numMaxElems_;
 
 public:
-    bufferCircular(int maxElems = 0);
+    explicit bufferCircular(int maxElems = 0);
 
     int getLen() const;
-    int getFirstType();
-    int getFirstPriority();
-    bool insertData(auto data, int type, int priority = 0);
-    bool searchData(auto data);
-    bool removeData(auto data);
-    auto getFirstData();
+
+    int getFirstType() const;
+    int getFirstPriority() const;
+    const BufferMessage &getFirstData() const;
+
+    // insere ordenado por prioridade (maior primeiro)
+    bool insertData(const BufferMessage &data, int type, int priority = 0);
+
+    bool searchData(const BufferMessage &data) const;
+    bool removeData(const BufferMessage &data);
 };
 
 #endif

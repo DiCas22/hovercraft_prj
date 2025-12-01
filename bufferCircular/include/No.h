@@ -1,30 +1,25 @@
 #ifndef NO_H
 #define NO_H
 
-#include <iostream>
-using namespace std;
+#include "../host_tools/msg_types.h"
 
 class No
 {
 private:
-    auto _data_;
+    BufferMessage _data_;
     No *_next_;
     int _type_;
     int _priority_;
 
 public:
-    No(auto initData = 0, int type, int priority = 0);
+    No(const BufferMessage &initData, int type, int priority = 0);
 
-    void setData(auto data);
-
+    void setData(const BufferMessage &data);
     void setNext(No *next);
 
-    auto getData() const;
-
+    const BufferMessage &getData() const;
     int getType() const;
-
     int getPriority() const;
-
     No *getNext() const;
 };
 

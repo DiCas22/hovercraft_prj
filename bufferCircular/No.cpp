@@ -1,14 +1,14 @@
 #include "No.h"
 
-No::No(auto initData = 0, int type, int priority = 0)
+No::No(const BufferMessage &initData, int type, int priority)
+    : _data_(initData),
+      _next_(nullptr),
+      _type_(type),
+      _priority_(priority)
 {
-    _data_ = initData;
-    _next_ = nullptr;
-    _type_ = type;
-    _priority_ = priority;
 }
 
-void No::setData(auto data)
+void No::setData(const BufferMessage &data)
 {
     _data_ = data;
 }
@@ -18,7 +18,7 @@ void No::setNext(No *next)
     _next_ = next;
 }
 
-auto No::getData() const
+const BufferMessage &No::getData() const
 {
     return _data_;
 }
