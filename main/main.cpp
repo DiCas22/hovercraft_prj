@@ -73,8 +73,8 @@ static const char *TAG = "HOVERCRAFT";
 // ============================
 
 // *** AJUSTE ESSAS STRINGS ***
-#define WIFI_SSID           "BLFIBRA_AP703-2.4G"
-#define WIFI_PASS           "olhanomodem"
+#define WIFI_SSID           "corowap2G"
+#define WIFI_PASS           "corowap2G"
 
 #define MQTT_URI            "mqtt://broker.hivemq.com:1883" 
 
@@ -213,7 +213,7 @@ static void pwm_init(void)
 
 static void esc_write_us(uint32_t us)
 {
-    if (us < 1000) us = 1000;
+    if (us < 1400) us = 1400;
     if (us > 2000) us = 2000;
 
     uint32_t duty = pwm_usec_to_duty(us);
@@ -228,8 +228,8 @@ static void esc_write_us(uint32_t us)
 
 static void servo_write_us(uint32_t us)
 {
-    if (us < 1000) us = 1000;
-    if (us > 2000) us = 2000;
+    if (us < 1250) us = 1250;
+    if (us > 1750) us = 1750;
 
     uint32_t duty = pwm_usec_to_duty(us);
     ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, PWM_SERVO_CHANNEL, duty));
