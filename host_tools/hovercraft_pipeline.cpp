@@ -243,11 +243,14 @@ public:
 // Detecta blob colorido e estima posição 3D aproximada
 std::optional<HovercraftState> detect_hovercraft_blob(
     const cv::Mat& frame, cv::Scalar hsv_low, cv::Scalar hsv_high,
-    double fx, double fy, double cx, double cy, double obj_real_mm)
+    double fx, double fy, double cx, double cy, double obj_real_mm,
+    cv::Point2f* out_center = nullptr, double* out_radius = nullptr)
 {
     HovercraftState state;
+
     cv::Mat hsv;
     cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+
     cv::Mat mask;
     cv::inRange(hsv, hsv_low, hsv_high, mask);
     cv::erode(mask, mask, {}, {}, 1);
@@ -255,21 +258,38 @@ std::optional<HovercraftState> detect_hovercraft_blob(
 
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    double best_area = 0;
-    int best = -1;
-    for (size_t i = 0; i < contours.size(); i++) {
-        double area = cv::contourArea(contours[i]);
-        if (area > best_area) { best_area = area; best = static_cast<int>(i); }
-    }
-    if (best < 0 || best_area < 20.0) return std::nullopt;
 
-    cv::Moments mu = cv::moments(contours[best]);
-    if (mu.m00 == 0.0) return std::nullopt;
+    double best_area = 0.0;
+    int best_idx = -1;
+    for (size_t i = 0; i < contours.size(); ++i) {
+        double area = cv::contourArea(contours[i]);
+        if (area > best_area) {
+            best_area = area;
+            best_idx  = static_cast<int>(i);
+        }
+    }
+
+    // Nada confiável encontrado
+    if (best_idx < 0 || best_area < 20.0) {
+        return std::nullopt;
+    }
+
+    cv::Moments mu = cv::moments(contours[best_idx]);
+    if (mu.m00 == 0.0) {
+        return std::nullopt;
+    }
 
     cv::Point2f c(static_cast<float>(mu.m10 / mu.m00),
                   static_cast<float>(mu.m01 / mu.m00));
 
-    double diam_img = 2.0 * std::sqrt(best_area / CV_PI);
+    double radius = std::sqrt(best_area / CV_PI);
+
+    // devolve infos pra desenhar
+    if (out_center) *out_center = c;
+    if (out_radius) *out_radius = radius;
+
+    // Estimativa grosseira de posição 3D (em mm)
+    double diam_img = 2.0 * radius;
     double z_mm = (obj_real_mm * fx) / diam_img;
     double x_mm = (c.x - cx) * z_mm / fx;
     double y_mm = (c.y - cy) * z_mm / fy;
@@ -278,10 +298,11 @@ std::optional<HovercraftState> detect_hovercraft_blob(
     state.y = y_mm;
     state.z = z_mm;
     state.t_ms = duration_cast<milliseconds>(
-        steady_clock::now().time_since_epoch()).count();
+                     steady_clock::now().time_since_epoch()).count();
     state.valid = true;
     return state;
 }
+
 
 // =================== Fusão/EKF simples ====================
 // Atualiza estado estimado usando IMU e correção da câmera
@@ -292,16 +313,15 @@ HovercraftState run_ekf(const HovercraftState& last,
 {
 HovercraftState est = last;
 
-// Protege contra dt maluco
 if (dt < 0.0) dt = 0.0;
-if (dt > 0.1) dt = 0.1; // máx 100 ms
+if (dt > 0.1) dt = 0.1; // max 100 ms
 
-// --------- 1) Propagação (modelo constante velocidade) ----------
+// Propagação: modelo de velocidade constante
 est.x += est.vx * dt;
 est.y += est.vy * dt;
 est.z += est.vz * dt;
 
-// Mantém acelerações e orientação vindas da IMU
+// Atualiza acelerações e orientação diretamente da IMU
 est.ax = imu.ax;
 est.ay = imu.ay;
 est.az = imu.az;
@@ -310,17 +330,15 @@ est.yaw   = imu.yaw;
 est.pitch = imu.pitch;
 est.roll  = imu.roll;
 
-// --------- 2) Correção por câmera (se tiver medição nova) -------
+// Correção com câmera (se houver medição nova)
 if (cam_obs && cam_obs->valid) {
-// Peso da medição da câmera (entre 0 e 1)
 constexpr double alpha = 0.25; // 25% câmera, 75% previsão
 
-// Low-pass entre previsão e medição
 est.x = (1.0 - alpha) * est.x + alpha * cam_obs->x;
 est.y = (1.0 - alpha) * est.y + alpha * cam_obs->y;
 est.z = (1.0 - alpha) * est.z + alpha * cam_obs->z;
 
-// Atualiza velocidades a partir do deslocamento medido
+// Estima velocidade a partir do deslocamento medido
 if (dt > 1e-3) {
 est.vx = (cam_obs->x - last.x) / dt;
 est.vy = (cam_obs->y - last.y) / dt;
@@ -330,10 +348,10 @@ est.vz = (cam_obs->z - last.z) / dt;
 
 est.t_ms = duration_cast<milliseconds>(
 steady_clock::now().time_since_epoch()).count();
-
 est.valid = true;
 return est;
 }
+
 
 // ============== Controle (PI plano XY) ================
 // Gera comandos de motor/servo a partir do estado e referência
@@ -343,29 +361,27 @@ void run_control(const HovercraftState& est, const TrajectoryRef& ref,
 static double int_ex = 0.0, int_ey = 0.0;
 constexpr double dt = 0.02;
 
-// Erro de posição
+// Erros de posição
 double ex = ref.x_ref - est.x;
 double ey = ref.y_ref - est.y;
 
-// Integradores
 int_ex += ex * dt;
 int_ey += ey * dt;
 
-// Ganhos (ajusta depois na prática)
 constexpr double Kp = 2.0;
 constexpr double Ki = 0.2;
 
 double ax_des = Kp * ex + Ki * int_ex;
 double ay_des = Kp * ey + Ki * int_ey;
 
-// Erro de "aceleração"
+// Erro entre aceleração desejada e medida
 double e_ax = ax_des - est.ax;
 double e_ay = ay_des - est.ay;
 
-double acc_cmd = std::sqrt(e_ax * e_ax + e_ay * e_ay);
+double acc_cmd = std::sqrt(e_ax*e_ax + e_ay*e_ay);
 
-// Limita módulo de "aceleração" desejada
-constexpr double ACC_MAX = 1.0; // ajusta na mão depois
+// Saturação
+constexpr double ACC_MAX = 1.0;
 if (acc_cmd > ACC_MAX) {
 double scale = ACC_MAX / acc_cmd;
 e_ax *= scale;
@@ -376,29 +392,24 @@ acc_cmd = ACC_MAX;
 // Direção da força no plano
 double dir_rad = std::atan2(e_ay, e_ax);
 
-// =============== Mapeamento para motor (ESC) =================
-// 1200us + ganho proporcional à "aceleração"
+// ESC: base 1200 µs + ganho na "aceleração"
 uint32_t motor_us = 1200u + static_cast<uint32_t>(acc_cmd * 500.0);
 motor_us = std::clamp(motor_us, 1000u, 2000u);
 
-// =============== Mapeamento para servo =======================
-// Queremos ±45° em relação ao neutro (1500us)
-constexpr double SERVO_MAX_DEG  = 45.0;
-constexpr double SERVO_MAX_RAD  = SERVO_MAX_DEG * M_PI / 180.0;
+// Servo: queremos ±45° em relação ao neutro (1500µs)
+constexpr double SERVO_MAX_DEG = 45.0;
+constexpr double SERVO_MAX_RAD = SERVO_MAX_DEG * M_PI / 180.0;
 
-// Limita a direção a ±45° para não ficar louco
 double dir_clamped = std::clamp(dir_rad, -SERVO_MAX_RAD, SERVO_MAX_RAD);
 
-// 1000–2000us ≈ ±90°. Então ±45° ≈ ±250us
+// 1000–2000 µs ~ ±90°. Logo ±45° ~ ±250µs
 constexpr double SERVO_US_PER_45DEG = 250.0;
 
 int servo_raw = 1500 + static_cast<int>(
-SERVO_US_PER_45DEG * (dir_clamped / SERVO_MAX_RAD)
-);
+SERVO_US_PER_45DEG * (dir_clamped / SERVO_MAX_RAD));
 
 uint32_t servo_us = static_cast<uint32_t>(
-std::clamp(servo_raw, 1100, 1900) // deixa uma folga das extremidades
-);
+std::clamp(servo_raw, 1100, 1900)); // evita bater no limite exato
 
 mqtt.publish_cmd(motor_us, servo_us);
 }
@@ -420,6 +431,7 @@ int main() {
     std::atomic<Mode> g_mode{Mode::AUTONOMOUS};
     std::atomic<bool> sensor_failure{false};
 
+    // Teleop sempre pode mandar comando (mesmo em falha de IMU)
     std::atomic<uint32_t> teleop_motor_us{1000};
     std::atomic<uint32_t> teleop_servo_us{1500};
 
@@ -463,16 +475,18 @@ int main() {
         log_state_change(SystemState::AUTONOMO_ATIVADO, "Modo inicial");
     }
 
-    // Thread de visão
+    // ================== Thread de Visao (com janela) ==================
     std::thread image_thread([&](){
         cv::VideoCapture cap(0);
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, W);
+        cap.set(cv::CAP_PROP_FRAME_WIDTH,  W);
         cap.set(cv::CAP_PROP_FRAME_HEIGHT, H);
 
         if (!cap.isOpened()) {
             std::cerr << "[IMG] Failed to open camera 0\n";
             return;
         }
+
+        cv::namedWindow("hovercraft_debug", cv::WINDOW_AUTOSIZE);
 
         while (running.load()) {
             cv::Mat frame;
@@ -481,47 +495,76 @@ int main() {
                 continue;
             }
 
+            cv::Point2f center;
+            double radius = 0.0;
+
             auto obs = detect_hovercraft_blob(
-                frame, HSV_LOW, HSV_HIGH, fx, fy, cx, cy, OBJ_REAL_MM
+                frame, HSV_LOW, HSV_HIGH,
+                fx, fy, cx, cy, OBJ_REAL_MM,
+                &center, &radius
             );
 
+            cv::Mat dbg = frame.clone();
+
             if (obs && obs->valid) {
-                std::lock_guard<std::mutex> lk(cam_mtx);
-                last_cam_obs = *obs;
-                new_cam_obs = true;
+                {
+                    std::lock_guard<std::mutex> lk(cam_mtx);
+                    last_cam_obs = *obs;
+                    new_cam_obs  = true;
+                }
+
+                cv::circle(dbg, center, static_cast<int>(radius),
+                           cv::Scalar(0, 255, 0), 2);
+                cv::circle(dbg, center, 3,
+                           cv::Scalar(0, 0, 255), -1);
+                cv::putText(dbg, "DETECTADO",
+                            cv::Point(20, 40),
+                            cv::FONT_HERSHEY_SIMPLEX, 1.0,
+                            cv::Scalar(0, 255, 0), 2);
+            } else {
+                cv::putText(dbg, "NAO DETECTADO",
+                            cv::Point(20, 40),
+                            cv::FONT_HERSHEY_SIMPLEX, 1.0,
+                            cv::Scalar(0, 0, 255), 2);
+            }
+
+            cv::imshow("hovercraft_debug", dbg);
+            int key = cv::waitKey(1);
+            if (key == 27) { // ESC
+                running.store(false);
+                break;
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         cap.release();
+        cv::destroyWindow("hovercraft_debug");
     });
 
-    // Thread de filtro / EKF + detecção de falha de sensor
+    // ========== Thread de Filtro / EKF + detecçao de falha ==========
     std::thread filter_thread([&](){
         HovercraftState local_est{};
         const auto period = std::chrono::milliseconds(20);
-    
+
         auto last_imu_time = steady_clock::now();
         auto last_cam_time = steady_clock::now();
-    
-        const auto sensor_timeout = std::chrono::milliseconds(1000);
-        const auto cam_soft_timeout  = std::chrono::milliseconds(500);  // fase de recuperação
-        const auto cam_hard_timeout  = std::chrono::milliseconds(3000); // desistir de vez
-    
-        bool vision_failed = false;
-    
-        // Para calcular dt do EKF
+
+        const auto sensor_timeout   = std::chrono::milliseconds(1000);
+        const auto cam_soft_timeout = std::chrono::milliseconds(500);
+        const auto cam_hard_timeout = std::chrono::milliseconds(3000);
+
+        bool vision_failed      = false;
+        bool vision_soft_warned = false;
+
         auto last_step_time = steady_clock::now();
-    
+
         while (running.load()) {
             auto now = steady_clock::now();
-    
-            // dt para o EKF
             double dt = std::chrono::duration_cast<std::chrono::duration<double>>(
                             now - last_step_time).count();
             last_step_time = now;
-    
+
             HovercraftState imu{};
             bool has_imu = false;
             {
@@ -532,37 +575,37 @@ int main() {
                     has_imu = true;
                 }
             }
-    
+
             std::optional<HovercraftState> cam_obs_copy;
             {
                 std::lock_guard<std::mutex> lk(cam_mtx);
                 if (new_cam_obs) {
                     cam_obs_copy = last_cam_obs;
-                    new_cam_obs = false;
+                    new_cam_obs  = false;
                     last_cam_time = now;
-    
-                    // Se a visão estava em falha, marca recuperação
-                    if (vision_failed) {
-                        vision_failed = false;
-    
+
+                    // reset flags de falha de visão
+                    if (vision_failed || vision_soft_warned) {
+                        vision_failed      = false;
+                        vision_soft_warned = false;
+
                         StatusEvent st{ "Visao recuperada" };
                         BufferMessage msg;
                         msg.type     = MsgType::STATUS_EVENT;
                         msg.priority = 7;
                         msg.payload  = st;
                         g_buffer.push(msg);
-    
+
                         log_state_change(SystemState::EM_TRAJETO,
                                          "Visao recuperada");
                     }
                 }
             }
-    
+
             if (has_imu) {
                 last_imu_time = now;
-    
-                // Se a IMU falhou antes e agora voltou, você pode
-                // limpar o sensor_failure aqui se quiser:
+
+                // Se IMU tinha falhado, marca recuperada
                 if (sensor_failure.load()) {
                     sensor_failure.store(false);
                     StatusEvent st{ "IMU recuperada" };
@@ -571,37 +614,37 @@ int main() {
                     msg.priority = 8;
                     msg.payload  = st;
                     g_buffer.push(msg);
-    
+
                     log_state_change(SystemState::EM_TRAJETO,
                                      "IMU recuperada");
                 }
-    
+
                 // EKF com dt real
                 local_est = run_ekf(local_est, cam_obs_copy, imu, dt);
-    
+
                 {
                     std::lock_guard<std::mutex> lk(est_mtx);
                     est_state = local_est;
                 }
-    
+
                 mqtt.publish_pose(local_est);
-    
+
                 BufferMessage msg;
                 msg.type     = MsgType::EKF_STATE;
                 msg.priority = 4;
                 msg.payload  = local_est;
                 g_buffer.push(msg);
             }
-    
-            // --------- Falha de IMU (mantém sua lógica) ---------------
+
+            // Falha de IMU -> para controle automático
             if (!sensor_failure.load() &&
                 now - last_imu_time > sensor_timeout) {
-    
+
                 sensor_failure.store(true);
                 mqtt.publish_cmd(1000, 1500);
                 log_state_change(SystemState::FALHA_SENSORES,
                                  "Sem dados de IMU por > 1s");
-    
+
                 StatusEvent st{ "Falha nos sensores (IMU)" };
                 BufferMessage msg;
                 msg.type     = MsgType::STATUS_EVENT;
@@ -609,47 +652,48 @@ int main() {
                 msg.payload  = st;
                 g_buffer.push(msg);
             }
-    
-            // --------- Rotina de RECUPERAÇÃO da câmera ----------------
+
+            // Rotina de recuperação da câmera
             auto dt_cam = now - last_cam_time;
-    
-            // Fase "soft": sem medição recente, mas ainda tentando seguir
-            // (deixa o EKF rodar com modelo de velocidade constante)
-            if (!vision_failed && dt_cam > cam_soft_timeout &&
-                dt_cam <= cam_hard_timeout) {
-    
+
+            // Aviso "soft" só UMA vez por perda
+            if (!vision_failed && !vision_soft_warned &&
+                dt_cam > cam_soft_timeout && dt_cam <= cam_hard_timeout) {
+
+                vision_soft_warned = true;
+
                 StatusEvent st{ "Visao temporariamente perdida, tentando recuperar" };
                 BufferMessage msg;
                 msg.type     = MsgType::STATUS_EVENT;
                 msg.priority = 5;
                 msg.payload  = st;
                 g_buffer.push(msg);
-    
-                // Aqui você pode também diminuir motor para evitar fugir do FOV:
-                mqtt.publish_cmd(1100, 1500); // aceleração bem baixa, servo central
+
+                // reduz motor pra tentar manter no FOV
+                mqtt.publish_cmd(1100, 1500);
             }
-    
-            // Fase "hard": perdeu por muito tempo
+
+            // Falha forte da camera (timeout longo) – também só UMA vez
             if (!vision_failed && dt_cam > cam_hard_timeout) {
                 vision_failed = true;
-    
-                mqtt.publish_cmd(1000, 1500); // para o barco
+
+                mqtt.publish_cmd(1000, 1500);
                 StatusEvent st{ "Falha na camera (timeout)" };
                 BufferMessage msg;
                 msg.type     = MsgType::STATUS_EVENT;
                 msg.priority = 8;
                 msg.payload  = st;
                 g_buffer.push(msg);
-    
+
                 log_state_change(SystemState::FALHA_SENSORES,
                                  "Camera perdeu o alvo por muito tempo");
             }
-    
+
             std::this_thread::sleep_for(period);
         }
     });
 
-    // Thread de controle (consumidor do buffer)
+    // ================== Thread de Controle ==================
     std::thread control_thread([&](){
         TrajectoryRef active_ref{};
         bool has_traj = false;
@@ -672,11 +716,13 @@ int main() {
 
             case MsgType::EKF_STATE: {
                 last_est = std::get<HovercraftState>(msg.payload);
-                if (g_mode.load() == Mode::AUTONOMOUS && has_traj) {
+                // Controle automático só roda se NÃO tiver falha de sensor
+                if (g_mode.load() == Mode::AUTONOMOUS &&
+                    has_traj && !sensor_failure.load()) {
                     run_control(last_est, active_ref, mqtt);
                     if (trajectory_finished(last_est, active_ref)) {
                         has_traj = false;
-                        StatusEvent st{ "Trajetória concluída" };
+                        StatusEvent st{ "Trajetoria concluida" };
                         BufferMessage done_msg;
                         done_msg.type     = MsgType::STATUS_EVENT;
                         done_msg.priority = 7;
@@ -690,10 +736,10 @@ int main() {
             case MsgType::TRAJECTORY: {
                 active_ref = std::get<TrajectoryRef>(msg.payload);
                 has_traj   = true;
-                std::cout << "[CTRL] Nova trajetória: x_ref="
+                std::cout << "[CTRL] Nova trajetoria: x_ref="
                           << active_ref.x_ref << ", y_ref=" << active_ref.y_ref << "\n";
 
-                StatusEvent st{ "Trajetória recebida" };
+                StatusEvent st{ "Trajetoria recebida" };
                 BufferMessage st_msg;
                 st_msg.type     = MsgType::STATUS_EVENT;
                 st_msg.priority = 7;
@@ -706,6 +752,7 @@ int main() {
 
             case MsgType::TELEOP_CMD: {
                 last_teleop = std::get<TeleopCmd>(msg.payload);
+                // Teleop sempre pode mandar comando, mesmo em falha de IMU
                 if (g_mode.load() == Mode::TELEOP) {
                     mqtt.publish_cmd(last_teleop.motor_us, last_teleop.servo_us);
                 }
@@ -715,80 +762,78 @@ int main() {
         }
     });
 
-        // Thread de teclado / teleop (modo raw, sem ENTER)
-        std::thread keyboard_thread([&](){
-            TerminalRawGuard guard;
-    
-            std::cout << "[KEY] Controle em tempo real ativo. 'x' sai do TELEOP.\n";
-    
-            while (running.load()) {
-                int ch = getchar();
-                if (ch == EOF) break;
-    
-                char c = static_cast<char>(ch);
-    
-                if (c == '1') {
-                    g_mode.store(Mode::AUTONOMOUS);
-                    log_state_change(SystemState::AUTONOMO_ATIVADO,
-                                     "Comando do teclado (1)");
-                    std::cout << "\n[MODE] AUTONOMOUS selecionado.\n";
-                } else if (c == '2') {
-                    g_mode.store(Mode::TELEOP);
-                    log_state_change(SystemState::TELEOP_ATIVADO,
-                                     "Comando do teclado (2)");
-                    std::cout << "\n[MODE] TELEOP selecionado.\n";
-                }
-    
-                Mode mode = g_mode.load();
-    
-                if ((c == 'x' || c == 'X') && mode == Mode::TELEOP) {
-                    teleop_motor_us.store(1000);
-                    teleop_servo_us.store(1500);
-                    mqtt.publish_cmd(1000, 1500);
-                    g_mode.store(Mode::AUTONOMOUS);
-                    log_state_change(SystemState::AUTONOMO_ATIVADO,
-                                     "Saida do teleop (x)");
-                    std::cout << "\n[MODE] Saindo do TELEOP -> AUTONOMOUS.\n";
-                    continue;
-                }
-    
-                // IMPORTANTE: teleop continua funcionando mesmo com falha de IMU
-                if (mode == Mode::TELEOP) {
-                    if (c == 'w' || c == 'W') {
-                        uint32_t m = teleop_motor_us.load();
-                        m = std::min(m + 10u, 2000u);
-                        teleop_motor_us.store(m);
-                    } else if (c == 's' || c == 'S') {
-                        uint32_t m = teleop_motor_us.load();
-                        if (m > 1000u) m -= 10u;
-                        teleop_motor_us.store(m);
-                    } else if (c == 'q' || c == 'Q') {
-                        uint32_t s = teleop_servo_us.load();
-                        if (s > 1000u) s -= 10u;
-                        teleop_servo_us.store(s);
-                    } else if (c == 'e' || c == 'E') {
-                        uint32_t s = teleop_servo_us.load();
-                        s = std::min(s + 10u, 2000u);
-                        teleop_servo_us.store(s);
-                    }
-    
-                    TeleopCmd cmd;
-                    cmd.motor_us = teleop_motor_us.load();
-                    cmd.servo_us = teleop_servo_us.load();
-    
-                    BufferMessage msg;
-                    msg.type     = MsgType::TELEOP_CMD;
-                    msg.priority = 6;
-                    msg.payload  = cmd;
-                    g_buffer.push(msg);
-    
-                    std::cout << "\r[TELEOP] motor_us=" << teleop_motor_us.load()
-                              << " servo_us=" << teleop_servo_us.load()
-                              << "           " << std::flush;
-                }
+    // ========== Thread de teclado / teleop (raw, sem ENTER) ==========
+    std::thread keyboard_thread([&](){
+        TerminalRawGuard guard;
+
+        std::cout << "[KEY] Controle em tempo real ativo. 'x' sai do TELEOP.\n";
+
+        while (running.load()) {
+            int ch = getchar();
+            if (ch == EOF) break;
+
+            char c = static_cast<char>(ch);
+
+            if (c == '1') {
+                g_mode.store(Mode::AUTONOMOUS);
+                log_state_change(SystemState::AUTONOMO_ATIVADO,
+                                 "Comando do teclado (1)");
+                std::cout << "\n[MODE] AUTONOMOUS selecionado.\n";
+            } else if (c == '2') {
+                g_mode.store(Mode::TELEOP);
+                log_state_change(SystemState::TELEOP_ATIVADO,
+                                 "Comando do teclado (2)");
+                std::cout << "\n[MODE] TELEOP selecionado.\n";
             }
-        });
-    
+
+            Mode mode = g_mode.load();
+
+            if ((c == 'x' || c == 'X') && mode == Mode::TELEOP) {
+                teleop_motor_us.store(1000);
+                teleop_servo_us.store(1500);
+                mqtt.publish_cmd(1000, 1500);
+                g_mode.store(Mode::AUTONOMOUS);
+                log_state_change(SystemState::AUTONOMO_ATIVADO,
+                                 "Saida do teleop (x)");
+                std::cout << "\n[MODE] Saindo do TELEOP -> AUTONOMOUS.\n";
+                continue;
+            }
+
+            if (mode == Mode::TELEOP) {
+                if (c == 'w' || c == 'W') {
+                    uint32_t m = teleop_motor_us.load();
+                    m = std::min(m + 10u, 2000u);
+                    teleop_motor_us.store(m);
+                } else if (c == 's' || c == 'S') {
+                    uint32_t m = teleop_motor_us.load();
+                    if (m > 1000u) m -= 10u;
+                    teleop_motor_us.store(m);
+                } else if (c == 'q' || c == 'Q') {
+                    uint32_t s = teleop_servo_us.load();
+                    if (s > 1000u) s -= 10u;
+                    teleop_servo_us.store(s);
+                } else if (c == 'e' || c == 'E') {
+                    uint32_t s = teleop_servo_us.load();
+                    s = std::min(s + 10u, 2000u);
+                    teleop_servo_us.store(s);
+                }
+
+                TeleopCmd cmd;
+                cmd.motor_us = teleop_motor_us.load();
+                cmd.servo_us = teleop_servo_us.load();
+
+                BufferMessage msg;
+                msg.type     = MsgType::TELEOP_CMD;
+                msg.priority = 6;
+                msg.payload  = cmd;
+                g_buffer.push(msg);
+
+                std::cout << "\r[TELEOP] motor_us=" << teleop_motor_us.load()
+                          << " servo_us=" << teleop_servo_us.load()
+                          << "           " << std::flush;
+            }
+        }
+    });
 
     if (keyboard_thread.joinable()) keyboard_thread.join();
 
